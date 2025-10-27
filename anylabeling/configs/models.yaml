@@ -344,3 +344,7 @@
   config_file: ":/yolox_l_dwpose_ucoco.yaml"
 - model_name: "yolox_s-r20230520"
   config_file: ":/yolox_s.yaml"
+- model_name: "deeplabv3_resnet50"
+  config_file: ":/deeplabv3_config.yaml"
+- model_name: "sam_image"
+  config_file: ":/sam_image.yaml"

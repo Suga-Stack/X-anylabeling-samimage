@@ -1881,6 +1881,66 @@ class ModelManager(QObject):
                     f"❌ Error in loading model: {model_config['type']} with error: {str(e)}"
                 )
                 return
+        elif model_config["type"] == "deeplabv3":
+            from .deeplabv3 import DeepLabV3
+
+            try:
+                model_config["model"] = DeepLabV3(
+                    model_config, on_message=self.new_model_status.emit
+                )
+                self.auto_segmentation_model_unselected.emit()
+                logger.info(
+                    f"✅ Model loaded successfully: {model_config['type']}"
+                )
+            except Exception as e:  # noqa
+                template = "Error in loading model: {error_message}"
+                translated_template = self.tr(template)
+                error_text = translated_template.format(error_message=str(e))
+                self.new_model_status.emit(error_text)
+                logger.error(
+                    f"❌ Error in loading model: {model_config['type']} with error: {str(e)}"
+                )
+                return
+        elif model_config["type"] == "sam_image":
+            from .sam_image import SAMImage
+            try:
+                model_config["model"] = SAMImage(
+                    model_config, on_message=self.new_model_status.emit
+                )
+                self.auto_segmentation_model_unselected.emit()
+                self.new_model_status.emit(
+                    self.tr("SAM Image model loaded successfully.")
+                )
+            except ImportError as e:
+                self.new_model_status.emit(
+                    self.tr(
+                        "SAM Image model requires PyTorch. Please install torch and torchvision: {error_message}".format(
+                            error_message=str(e)
+                        )
+                    )
+                )
+                print(f"SAM Image model requires PyTorch: {e}")
+                return
+            except FileNotFoundError as e:
+                self.new_model_status.emit(
+                    self.tr(
+                        "Model file not found. Please check the model path: {error_message}".format(
+                            error_message=str(e)
+                        )
+                    )
+                )
+                print(f"Model file not found: {e}")
+                return
+            except Exception as e:
+                self.new_model_status.emit(
+                    self.tr(
+                        "Error in loading SAM Image model: {error_message}".format(
+                            error_message=str(e)
+                        )
+                    )
+                )
+                print(f"Error in loading SAM Image model: {e}")
+                return
         else:
             raise Exception(f"Unknown model type: {model_config['type']}")
 

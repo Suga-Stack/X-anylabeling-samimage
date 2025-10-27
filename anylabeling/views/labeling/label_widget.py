@@ -4923,8 +4923,18 @@ class LabelingWidget(LabelDialog):
             os.remove(label_file)
             logger.info(f"Label file is removed: {label_file}")
 
+            # 当前列表项可能为空（例如列表未聚焦或没有选中项），做空值保护并尽力定位对应项
             item = self.file_list_widget.currentItem()
-            item.setCheckState(Qt.Unchecked)
+            if item is None:
+                # 尝试通过文件名索引定位
+                try:
+                    idx = self.fn_to_index.get(str(self.filename))
+                except Exception:
+                    idx = None
+                if isinstance(idx, int) and 0 <= idx < self.file_list_widget.count():
+                    item = self.file_list_widget.item(idx)
+            if item is not None:
+                item.setCheckState(Qt.Unchecked)
 
             filename = self.filename
             self.reset_state()
