@@ -52,7 +52,6 @@ class TwoWayTransformer(nn.Module):
                     vatt_flag=True
                 else:
                     vatt_flag=False
-            print("1111111111111111111111111", vatt_flag)
             self.layers.append(
                 TwoWayAttentionBlock(
                     embedding_dim=embedding_dim,

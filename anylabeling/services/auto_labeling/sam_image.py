@@ -165,38 +165,69 @@ class SAMImage(Model):
         return point_coords, point_labels, box
 
     def _initialize_model(self):
-        """初始化SAM模型，加载LoRA权重"""
+        """初始化SAM模型，支持先加载 base 权重（例如 vit_b.pth），再加载小的 adapter/LoRA 权重。
+
+        兼容以下情况：
+        - 单一 model_path（历史行为，加载一个完整权重或部分权重）
+        - 提供 base_model_path + model_path（推荐）：先加载 base，再加载 adapter（strict=False）
+        """
         try:
-            # 创建基础模型
+            # 创建基础模型（不传 checkpoint）
             net = sam_model_registry[self.model_cfg](checkpoint=None)
-            
-            # 准备LoRA结构
+
+            # 准备 LoRA 结构（替换相应层以便加载 adapter 权重）
             prepare_lora(self.model_cfg, net, self.lora_r)
-            
-            # 加载训练好的权重
-            checkpoint = torch.load(self.model_path, map_location="cpu")
-            if 'model_state_dict' in checkpoint:
-                state_dict = checkpoint['model_state_dict']
+
+            # --- 加载 base 权重 ---
+            base_path = self.config.get("base_model_path") or self.model_path
+            if not base_path or not os.path.isfile(base_path):
+                logger.error(f"Base model path not found: {base_path}")
+                raise FileNotFoundError(f"Base model not found: {base_path}")
+
+            base_ckpt = torch.load(base_path, map_location="cpu")
+            if isinstance(base_ckpt, dict) and "model_state_dict" in base_ckpt:
+                base_state = base_ckpt["model_state_dict"]
             else:
-                state_dict = checkpoint
-                
-            # 加载权重，忽略不匹配的键
-            missing_keys, unexpected_keys = net.load_state_dict(state_dict, strict=False)
-            
+                base_state = base_ckpt
+
+            missing_keys, unexpected_keys = net.load_state_dict(base_state, strict=False)
             if missing_keys:
-                logger.warning(f"缺失的权重键: {missing_keys}")
+                logger.warning(f"Base load 缺失键: {missing_keys}")
             if unexpected_keys:
-                logger.warning(f"意外的权重键: {unexpected_keys}")
-                
-            # 设置掩码阈值
+                logger.warning(f"Base load 意外键: {unexpected_keys}")
+
+            # --- 如果有 adapter（小权重），再加载它以覆盖 LoRA 部分 ---
+            adapter_path = self.config.get("adapter_path") or self.config.get("model_path")
+            # 确保 adapter_path 存在且不是与 base 相同的文件
+            if (
+                adapter_path
+                and os.path.isfile(adapter_path)
+                and os.path.abspath(adapter_path) != os.path.abspath(base_path)
+            ):
+                adapter_ckpt = torch.load(adapter_path, map_location="cpu")
+                if isinstance(adapter_ckpt, dict):
+                    if "model_state_dict" in adapter_ckpt:
+                        adapter_state = adapter_ckpt["model_state_dict"]
+                    elif "state_dict" in adapter_ckpt:
+                        adapter_state = adapter_ckpt["state_dict"]
+                    else:
+                        adapter_state = adapter_ckpt
+                else:
+                    adapter_state = adapter_ckpt
+
+                missing_keys2, unexpected_keys2 = net.load_state_dict(adapter_state, strict=False)
+                if missing_keys2:
+                    logger.info(f"Adapter load - 缺失键: {missing_keys2}")
+                if unexpected_keys2:
+                    logger.info(f"Adapter load - 意外键: {unexpected_keys2}")
+                logger.info(f"已加载 adapter 权重: {adapter_path}")
+
+            # 最终设置
             net.mask_threshold = float(self.mask_threshold)
-            
-            self.net = net
-            self.net.to(self.device)
+            self.net = net.to(self.device)
             self.net.eval()
-            
             logger.info(f"模型加载成功: {self.model_cfg}, LoRA r={self.lora_r}")
-            
+
         except Exception as e:
             logger.error(f"模型初始化失败: {e}")
             raise

@@ -4,7 +4,7 @@ display_name: SAM Image (ViT-B)
 version: 2.0
 description: 基于SAM的半导体缺陷检测模型，支持矩形提示的自动标注
 model_cfg: vit_b
-model_path: D:/homework/fengzhuang1/x-anylabeling/x-anylabeling/vit_b.pth
+model_path: anylabeling/services/auto_labeling/samimage/pretrained_checkpoint/vit_b.pth
 device_type: cuda
 input_size: 1024
 mask_threshold: 0.5

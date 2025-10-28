@@ -15,10 +15,12 @@ from segment_anything_training import sam_model_registry
 from segment_anything_training.modeling import TwoWayTransformer, MaskDecoder
 
 from utils.dataloader import get_im_gt_name_dict, create_dataloaders, RandomHFlip, Resize, LargeScaleJitter
-# from utils.dataloader2 import get_im_gt_name_dict, create_dataloaders, RandomHFlip, Resize, LargeScaleJitter
-from utils.loss_mask import loss_masks
+from utils.loss_mask import loss_masks, sigmoid_ce_loss_jit, dice_loss_jit
 import utils.misc as misc
 import logging
+from gather_hx_data import get_all_hx_train, get_all_hx_val
+import datetime
+
 
 def show_anns(masks, input_point, input_box, input_label, filename, image, ious, boundary_ious):
     if len(masks) == 0:
@@ -62,10 +64,7 @@ def get_args_parser():
     home = os.path.expanduser('~')
     
     parser = argparse.ArgumentParser('spt', add_help=False)
-
-    # parser.add_argument('--train-data', required=True, type=str)
     parser.add_argument('--dataset-path', default=f"{home}/datasets/OpenDataLab___SA-1B")
-    # parser.add_argument('--train-data-list', default='train_data.txt')
     parser.add_argument("--output", type=str, required=True, 
                         help="Path to the directory where masks and checkpoints will be output")
     parser.add_argument("--model-type", type=str, default="vit_l", 
@@ -94,7 +93,6 @@ def get_args_parser():
     parser.add_argument('--find_unused_params', action='store_true')
 
     parser.add_argument('--eval', action='store_true')
-    parser.add_argument('--visualize', action='store_true')
     parser.add_argument("--restore-model", type=str,
                         help="The path to the hq_decoder training checkpoint for evaluation")
 
@@ -102,11 +100,10 @@ def get_args_parser():
     parser.add_argument("--val-point-prompt", default=-1, type=int)
 
     parser.add_argument("--lora-r", default=8, type=int)
-    parser.add_argument("--train-percent", default=75, type=int)
+    parser.add_argument("--obj", default="05ELD", type=str)
 
     return parser.parse_args()
 
-from utils.train_dataloder import DRAEMTrainDataset
 from torch.utils.data.distributed import DistributedSampler
 from glob import glob
 from lora import Linear, MergedLinear, ConvLoRA, mark_only_lora_as_trainable, lora_state_dict
@@ -136,6 +133,7 @@ def freeze_bn_stats(model: nn.Module):
     for _, module in model.named_modules():
         if isinstance(module, nn.BatchNorm2d):
             module.eval()
+            
 
 def main(net, train_datasets, valid_datasets, args):
     ### --- Step 1: Train or Valid dataset ---
@@ -149,17 +147,6 @@ def main(net, train_datasets, valid_datasets, args):
                                                                     ],
                                                         batch_size = args.batch_size_train,
                                                         training = True)
-
-        # with open(args.train_data_list, 'r') as f:
-        #     train_dirs = f.readlines()
-        #     train_dirs = [d.strip().replace('.tar', '') for d in train_dirs]
-        
-        # train_dirs = glob("data/mvtec_raw/*/train/good/")
-        # train_datasets = DRAEMTrainDataset(args.dataset_path, train_dirs)
-        # sampler = DistributedSampler(train_datasets)
-        # batch_sampler_train = torch.utils.data.BatchSampler(sampler, args.batch_size_train, drop_last=True)
-        # train_dataloaders = torch.utils.data.DataLoader(train_datasets, batch_sampler=batch_sampler_train, num_workers=4)
-        # print(len(train_dataloaders), " train dataloaders created")
 
     logging.info("--- create valid dataloader ---")
     valid_im_gt_list = get_im_gt_name_dict(valid_datasets, flag="valid")
@@ -208,7 +195,6 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
         metric_logger = misc.MetricLogger(delimiter="  ")
         train_dataloaders.batch_sampler.sampler.set_epoch(epoch)
 
-        train_image_id = 0
         for data in metric_logger.log_every(train_dataloaders,100, logger=logging):
             inputs, labels = data['image'], data['label']
 
@@ -260,20 +246,78 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
             
             loss_mask, loss_dice = loss_masks(masks_hq, labels/255.0, len(masks_hq))
             loss = loss_mask + loss_dice
-            
-            loss_dict = {"loss_mask": loss_mask, "loss_dice":loss_dice}
 
-            # reduce losses over all GPUs for logging purposes
+            refine_loss = torch.tensor(0.0, device=loss.device)
+            
+            with torch.no_grad():
+                for i, box in enumerate(labels_box):
+                    x1, y1, x2, y2 = box
+                    box_area = (x2 - x1) * (y2 - y1)
+                    img_h, img_w = imgs[i].shape[:2]
+                    area_ratio = box_area / (img_h * img_w)
+
+                    if area_ratio < 0.0001:
+                        continue
+
+                    w = (x2 - x1) / 3
+                    h = (y2 - y1) / 3
+                    sub_losses = []
+
+                    for r in range(3):
+                        for c in range(3):
+                            sub_x1 = int(x1 + c * w)
+                            sub_y1 = int(y1 + r * h)
+                            sub_x2 = int(sub_x1 + w)
+                            sub_y2 = int(sub_y1 + h)
+                            
+                            pred_patch = masks_hq[i:i + 1, :, sub_y1:sub_y2, sub_x1:sub_x2]
+                            gt_patch = labels[i:i + 1, :, sub_y1:sub_y2, sub_x1:sub_x2] / 255.0
+
+                            if pred_patch.numel() == 0:
+                                sub_losses.append(torch.tensor(0.0, device=loss.device))
+                                continue
+
+                            l_mask, l_dice = loss_masks(pred_patch, gt_patch, 1)
+                            sub_losses.append(l_mask + l_dice)
+
+                    sub_losses = torch.stack(sub_losses)
+                    hardest_idx = torch.argmax(sub_losses)
+                    hardest_r, hardest_c = hardest_idx // 3, hardest_idx % 3
+                    hardest_box = [
+                        x1 + hardest_c * w,
+                        y1 + hardest_r * h,
+                        x1 + (hardest_c + 1) * w,
+                        y1 + (hardest_r + 1) * h,
+                    ]
+                    hardest_box = torch.tensor(hardest_box, device=net.device).unsqueeze(0)
+
+                    sub_input = {
+                        'image': torch.as_tensor(imgs[i].astype(np.uint8), device=net.device)
+                        .permute(2, 0, 1).contiguous(),
+                        'boxes': hardest_box,
+                        'original_size': imgs[i].shape[:2]
+                    }
+
+                    sub_output, _ = net([sub_input], multimask_output=False)
+                    sub_mask_pred = sub_output[0]['low_res_logits']
+                    l_mask, l_dice = loss_masks(sub_mask_pred, labels[i:i + 1] / 255.0, 1)
+                    refine_loss += (l_mask + l_dice)
+
+            total_loss = loss + refine_loss
+
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+
+            loss_dict = {
+                "loss_mask": loss_mask,
+                "loss_dice": loss_dice,
+                "refine_loss": refine_loss.detach()
+            }
             loss_dict_reduced = misc.reduce_dict(loss_dict)
             losses_reduced_scaled = sum(loss_dict_reduced.values())
             loss_value = losses_reduced_scaled.item()
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
             metric_logger.update(training_loss=loss_value, **loss_dict_reduced)
-
 
         logging.info(f"Finished epoch:      {epoch}")
         metric_logger.synchronize_between_processes()
@@ -386,33 +430,7 @@ def evaluate(args, net, valid_dataloaders, valid_datasets, visualize=False):
                 
             iou = compute_iou(masks_hq,labels_ori)
             boundary_iou = compute_boundary_iou(masks_hq,labels_ori)
-
-            if visualize:
-                logging.info("visualize")
-                # os.makedirs(args.output, exist_ok=True)
-                masks_hq_vis = (F.interpolate(masks_hq.detach(), (1024, 1024), mode="bilinear", align_corners=False) > 0).cpu()
-                for ii in range(len(imgs)):
-                    ori_img_path = data_val["ori_im_path"][ii]
-                    dataset = ori_img_path.split("/")[1]
-                    img_name = ori_img_path.split("/")[-1].split(".")[0] + "_pred"
-                    
-                    # base = data_val['imidx'][ii].item()
-                    # logging.info(f"base: {base}")
-                    # save_base = os.path.join(args.output, str(k)+'_'+ str(base))
-                    imgs_ii = imgs[ii].astype(dtype=np.uint8)
-                    show_iou = torch.tensor([iou.item()])
-                    show_boundary_iou = torch.tensor([boundary_iou.item()])
-                    # show_anns(masks_hq_vis[ii], None, labels_box[ii].cpu(), None, save_base , imgs_ii, show_iou, show_boundary_iou)
-                    
-                    # max box
-                    # save_img_dir = os.path.join("visualize/full_lora", args.model_type + "_" + "max_box", dataset)
-                    save_img_dir = os.path.join("visualize/full_lora", args.model_type + "_" + "point5", dataset)
-                    os.makedirs(save_img_dir, exist_ok=True)
-                    save_img_path = os.path.join(save_img_dir, img_name)
-                    show_anns(masks_hq_vis[ii], None, labels_box[ii].cpu(), None, save_img_path , imgs_ii, show_iou, show_boundary_iou)
-                    
-                       
-
+            
             loss_dict = {"val_iou_"+str(k): iou, "val_boundary_iou_"+str(k): boundary_iou}
             loss_dict_reduced = misc.reduce_dict(loss_dict)
             metric_logger.update(**loss_dict_reduced)
@@ -434,28 +452,13 @@ def evaluate(args, net, valid_dataloaders, valid_datasets, visualize=False):
     logging.info(f"[{args.model_type}] Final results: IoU, BIoU: {round(avg_ious.mean(), 3)}, {round(avg_bious.mean(), 3)}")
     return test_stats, avg_ious.mean()
 
-from gather_luster_data_90 import get_all_luster_train, get_all_luster_val
-# from gather_luster_data import get_all_luster_train, get_all_luster_val
-import datetime
 
-# def gather_all_val(val_data):
-#     val_datasets = []
-#     for d in os.listdir(val_data):
-#         val_datasets.append({
-#                 "name": f"{val_data}/{d}",
-#                 "im_dir": f"{val_data}/{d}/test",
-#                 "gt_dir": f"{val_data}/{d}/test",
-#                 "im_ext": ".jpg",
-#                 "gt_ext": ".png"
-#             })
-#     return val_datasets
+
 
 if __name__ == "__main__":
     args = get_args_parser()
     misc.init_distributed_mode(args)
     
-    if not args.eval:
-        args.output = args.output + '/' + datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
     if args.rank == 0:
         os.makedirs(args.output, exist_ok=True)
         logging.basicConfig(
@@ -482,27 +485,14 @@ if __name__ == "__main__":
     torch.cuda.manual_seed_all(seed) 
     torch.backends.cudnn.deterministic = True
 
-    ### --------------- Configuring the Train and Valid datasets ---------------
-    # dataset_synthetic = {
-    #     "name": "synthetic",
-    #     "im_dir": args.train_data,
-    #     "gt_dir": args.train_data,
-    #     "im_ext": ".jpg",
-    #     "gt_ext": ".png"
-    # }
-
-    # valid set
-    # train_datasets = get_all_luster_train(args.train_percent)
-    # valid_datasets = get_all_luster_val(args.train_percent)
-    if "1010-hx-90-1" in args.output:
+    if "hx-25-1" in args.output:
         num = 1
-    elif "1010-hx-90-2" in args.output:
+    elif "hx-25-2" in args.output:
         num = 2
-    elif "1010-hx-90-3" in args.output:
+    elif "hx-25-3" in args.output:
         num = 3
-    train_datasets = get_all_luster_train(num)
-    valid_datasets = get_all_luster_val(num)
-    # print(valid_datasets)
+    train_datasets = get_all_hx_train(num, [args.obj])
+    valid_datasets = get_all_hx_val(num, [args.obj])
     
     net = sam_model_registry[args.model_type](checkpoint=args.checkpoint)
     state = net.state_dict()

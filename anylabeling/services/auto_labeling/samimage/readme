@@ -1,0 +1,32 @@
+### 数据
+在根目录新建三个文件夹，data_25_1，data_25_2，data_25_3，里面分别放5个型号的数据文件
+
+文件树如下：
+data_25_1
+    05ELD_4
+        test
+            img
+            mask
+        train_25
+            img
+            mask
+    2240L_1
+        test
+        train_25
+    B0406B_1
+        test
+        train_25
+    beiguangjian_3
+        test
+        train_25
+    kuandai_1
+        test
+        train_25
+
+
+### 环境
+见condalist.txt
+
+
+### 训练和测试
+见train.sh
