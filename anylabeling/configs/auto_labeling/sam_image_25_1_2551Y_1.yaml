@@ -1,0 +1,28 @@
+type: sam_image
+name: sam_image_25_1_2551Y_1
+display_name: SAM Image (25-1-2551Y_1)
+version: 2.0
+description: SAM 对 25-1-2551Y_1 的 LoRA 微调权重
+model_cfg: vit_b
+base_model_path: anylabeling/services/auto_labeling/samimage/pretrained_checkpoint/vit_b.pth
+model_path: anylabeling/services/auto_labeling/samimage/ckpt/25-1-2551Y_1.pth
+adapter_path: anylabeling/services/auto_labeling/samimage/ckpt/25-1-2551Y_1.pth
+device_type: cuda
+input_size: 1024
+mask_threshold: 0.5
+lora_r: 8
+widgets:
+  - output_label
+  - output_select_combobox
+  - button_add_rect
+  - button_clear
+  - toggle_preserve_existing_annotations
+  - mask_fineness_slider
+  - mask_fineness_value_label
+output_modes:
+  "polygon": "多边形"
+  "rectangle": "矩形"
+  "mask": "掩码"
+default_output_mode: polygon
+classes:
+  - defect

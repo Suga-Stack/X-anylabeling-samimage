@@ -77,6 +77,7 @@ _CUSTOM_MODELS = [
     "deimv2",
     "deeplabv3",
     "sam_image",
+    "sam_image_vit_l",
 ]
 
 
@@ -94,6 +95,7 @@ _AUTO_LABELING_MARKS_MODELS = [
     "sam_med2d",
     "sam_hq",
     "sam_image",
+    "sam_image_vit_l",
     "yolov5_sam",
     "efficientvit_sam",
     "grounding_sam",
@@ -114,6 +116,7 @@ _AUTO_LABELING_MASK_FINENESS_MODELS = [
     "sam_med2d",
     "sam_hq",
     "sam_image",
+    "sam_image_vit_l",
     "yolov5_sam",
     "efficientvit_sam",
     "grounding_sam",
@@ -286,6 +289,7 @@ _AUTO_LABELING_PRESERVE_EXISTING_ANNOTATIONS_STATE_MODELS = [
     "yoloe",
     "segment_anything_2_video",
     "sam_image",
+    "sam_image_vit_l",
 ]
 
 

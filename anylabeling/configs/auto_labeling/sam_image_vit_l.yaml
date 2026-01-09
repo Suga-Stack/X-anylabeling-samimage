@@ -1,0 +1,27 @@
+type: sam_image
+name: sam_image_vit_l
+display_name: SAM Image (ViT-L)
+version: 2.0
+description: 基于SAM的半导体缺陷检测模型，支持矩形提示的自动标注
+model_cfg: vit_l
+model_path: D:/homework/fengzhuang1/x-anylabeling/x-anylabeling/vit_l.pth
+device_type: cuda
+input_size: 1024
+mask_threshold: 0.5
+confidence_threshold: 0.5
+lora_r: 8
+widgets:
+  - output_label
+  - output_select_combobox
+  - button_add_rect
+  - button_clear
+  - toggle_preserve_existing_annotations
+  - mask_fineness_slider
+  - mask_fineness_value_label
+output_modes:
+  "polygon": "多边形"
+  "rectangle": "矩形" 
+  "mask": "掩码"
+default_output_mode: polygon
+classes:
+  - defect

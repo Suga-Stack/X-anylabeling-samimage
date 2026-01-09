@@ -378,5 +378,7 @@
   config_file: ":/yolox_s.yaml"
 - model_name: "deeplabv3_resnet50"
   config_file: ":/deeplabv3_config.yaml"
+- model_name: "sam_image_vit_l"
+  config_file: ":/sam_image_vit_l.yaml"
 - model_name: "sam_image"
   config_file: ":/sam_image.yaml"
