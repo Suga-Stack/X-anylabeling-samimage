@@ -1,4 +1,4 @@
-type: sam_image
+type: sam_lora
 name: sam_image_vit_b
 display_name: SAM Image (ViT-B)
 version: 2.0

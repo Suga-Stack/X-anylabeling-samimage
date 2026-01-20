@@ -1,4 +1,4 @@
-type: sam_image
+type: sam_lora
 name: sam_image_vit_l
 display_name: SAM Image (ViT-L)
 version: 2.0
@@ -6,7 +6,7 @@ description: 基于SAM的半导体缺陷检测模型，支持矩形提示的自�
 model_cfg: vit_l
 model_path: D:/homework/fengzhuang1/x-anylabeling/x-anylabeling/vit_l.pth
 device_type: cuda
-input_size: 1024
+input_size: 1280
 mask_threshold: 0.5
 confidence_threshold: 0.5
 lora_r: 8

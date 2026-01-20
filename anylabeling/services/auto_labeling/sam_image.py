@@ -86,6 +86,9 @@ class SAMImage(Model):
         self.input_size = self.config.get("input_size", [1024, 1024])
         self.mask_threshold = self.config.get("mask_threshold", 0.5)
         
+        # 最长边的目标尺寸（保持宽高比）
+        self.max_input_size = 1024
+        
         if not self.model_path or not os.path.isfile(self.model_path):
             logger.error(f"Model path not found: {self.model_path}")
             raise FileNotFoundError("SAM模型权重文件未找到")
@@ -102,11 +105,142 @@ class SAMImage(Model):
         # 类别配置
         self.classes = self.config.get("classes", ["defect"])
         
+        # 缩放因子（用于坐标映射）
+        self.scale_factor = 1.0
+        self.original_size = None
+        self.resized_size = None
+        
         logger.info("清华聚好看-SAM缺陷检测模型初始化完成")
 
     def set_mask_fineness(self, epsilon: float):
         """设置轮廓平滑系数"""
         self.epsilon = max(0.001, min(0.1, float(epsilon)))
+
+    def _calculate_resize_scale(self, image_h: int, image_w: int) -> tuple:
+        """计算缩放因子，保持宽高比，最长边缩到max_input_size以内
+        
+        Args:
+            image_h: 原图高度
+            image_w: 原图宽度
+            
+        Returns:
+            tuple: (scale_factor, resized_h, resized_w)
+        """
+        max_side = max(image_h, image_w)
+        
+        if max_side <= self.max_input_size:
+            # 无需缩放
+            return 1.0, image_h, image_w
+        
+        # 计算缩放因子
+        scale = self.max_input_size / max_side
+        resized_h = int(image_h * scale)
+        resized_w = int(image_w * scale)
+        
+        return scale, resized_h, resized_w
+
+    def _resize_image(self, image: np.ndarray) -> np.ndarray:
+        """对输入图像进行缩放（保持宽高比，最长边缩到max_input_size以内）
+        
+        Args:
+            image: 原始图像 (H, W, C)
+            
+        Returns:
+            np.ndarray: 缩放后的图像
+        """
+        image_h, image_w = image.shape[:2]
+        self.scale_factor, resized_h, resized_w = self._calculate_resize_scale(image_h, image_w)
+        self.original_size = (image_h, image_w)
+        self.resized_size = (resized_h, resized_w)
+        
+        if self.scale_factor == 1.0:
+            return image
+        
+        # 使用cv2缩放
+        resized_image = cv2.resize(image, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
+        logger.debug(f"图像缩放: {image_h}x{image_w} -> {resized_h}x{resized_w} (scale={self.scale_factor:.4f})")
+        
+        return resized_image
+
+    def _scale_marks_to_resized(self) -> tuple:
+        """将原始尺寸的marks缩放到缩放后的尺寸
+        
+        Returns:
+            tuple: (point_coords, point_labels, box) - 缩放后的提示
+        """
+        point_coords, point_labels, box = None, None, None
+        
+        for m in self.marks:
+            if not isinstance(m, dict) or 'type' not in m:
+                continue
+                
+            if m['type'] == 'rectangle':
+                data = m.get('data')
+                if data is None:
+                    continue
+                    
+                try:
+                    if isinstance(data, (list, tuple, np.ndarray)):
+                        arr = np.array(data, dtype=np.float32)
+                        if arr.size == 4:
+                            x0, y0, x1, y1 = arr.tolist()
+                        elif arr.shape == (2, 2):
+                            (x0, y0), (x1, y1) = arr.tolist()
+                        else:
+                            continue
+                        
+                        # 缩放坐标
+                        box = [
+                            float(max(0, x0 * self.scale_factor)),
+                            float(max(0, y0 * self.scale_factor)), 
+                            float(x1 * self.scale_factor),
+                            float(y1 * self.scale_factor)
+                        ]
+                        logger.debug(f"矩形提示缩放: ({x0}, {y0}, {x1}, {y1}) -> ({box[0]:.1f}, {box[1]:.1f}, {box[2]:.1f}, {box[3]:.1f})")
+                        break
+                except Exception as e:
+                    logger.warning(f"矩形提示缩放失败: {e}")
+                    continue
+                    
+            elif m['type'] == 'point':
+                logger.debug("检测到点提示")
+                pass
+        
+        return point_coords, point_labels, box
+
+    def _scale_results_back_to_original(self, results: list) -> list:
+        """将缩放后的检测结果坐标映射回原始图像尺寸
+        
+        Args:
+            results: 缩放图像上的检测结果
+            
+        Returns:
+            list: 映射到原始尺寸的检测结果
+        """
+        if self.scale_factor == 1.0:
+            return results
+        
+        scaled_results = []
+        
+        for label, contours in results:
+            scaled_contours = []
+            
+            for points in contours:
+                # 将每个点的坐标缩放回原始尺寸
+                scaled_points = []
+                for point in points:
+                    # point 是 [x, y]
+                    scaled_x = point[0] / self.scale_factor
+                    scaled_y = point[1] / self.scale_factor
+                    scaled_points.append([scaled_x, scaled_y])
+                
+                scaled_contours.append(scaled_points)
+            
+            scaled_results.append((label, scaled_contours))
+        
+        logger.debug(f"坐标已映射回原始尺寸 (scale={1/self.scale_factor:.4f})")
+        return scaled_results
+
 
     def set_auto_labeling_marks(self, marks):
         """由 UI 注入交互标记（点/框）"""
@@ -122,6 +256,10 @@ class SAMImage(Model):
         返回:
             tuple: (point_coords, point_labels, box)
         """
+        # 对于已经初始化过的缩放，使用缩放后的marks
+        if self.scale_factor != 1.0:
+            return self._scale_marks_to_resized()
+        
         point_coords, point_labels, box = None, None, None
         
         for m in self.marks:
@@ -234,6 +372,9 @@ class SAMImage(Model):
 
     def preprocess(self, input_image):
         """预处理输入图像"""
+        # 首先对图像进行缩放（保持宽高比，最长边缩到1024以内）
+        input_image = self._resize_image(input_image)
+        
         # 确保为3通道RGB
         if len(input_image.shape) < 3:
             input_image = input_image[:, :, np.newaxis]
@@ -242,7 +383,7 @@ class SAMImage(Model):
         elif input_image.shape[2] == 4:
             input_image = input_image[:, :, :3]  # 移除alpha通道
 
-        # 原图尺寸
+        # 缩放后的图像尺寸
         h, w = input_image.shape[:2]
 
         # 转换为 3xHxW 的 float32 Tensor
@@ -252,7 +393,7 @@ class SAMImage(Model):
             .contiguous()
         )
 
-        # 将交互标记转换为 box 提示
+        # 将交互标记转换为 box 提示（使用缩放后的坐标）
         _, _, box = self.marks_to_prompts()
         box_tensor = None
         if box is not None:
@@ -344,6 +485,9 @@ class SAMImage(Model):
                 results.append((label_name, contour_points))
                 logger.debug(f"检测到 {len(contour_points)} 个缺陷区域")
 
+        # 将坐标映射回原始图像尺寸
+        results = self._scale_results_back_to_original(results)
+        
         return results
 
     def predict_shapes(self, image, image_path=None):
@@ -357,7 +501,18 @@ class SAMImage(Model):
             logger.warning(f"图像转换失败: {e}")
             return AutoLabelingResult([], replace=False)
 
-        # 检查是否有交互提示
+        # 重置缩放因子（为下一次预测准备）
+        self.scale_factor = 1.0
+        self.original_size = None
+        self.resized_size = None
+
+        # 先计算会使用的缩放因子（不实际缩放图像）
+        image_h, image_w = image.shape[:2]
+        max_side = max(image_h, image_w)
+        if max_side > self.max_input_size:
+            self.scale_factor = self.max_input_size / max_side
+        
+        # 检查是否有交互提示（此时scale_factor已正确设置）
         _, _, maybe_box = self.marks_to_prompts()
         if maybe_box is None:
             logger.debug("未检测到矩形提示，跳过预测")
