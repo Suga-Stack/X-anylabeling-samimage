@@ -20,3 +20,6 @@ jsonlines
 json_repair
 importlib_metadata
 markdown
+torch
+torchvision
+timm
