@@ -584,6 +584,11 @@ class AutoLabelingWidget(QWidget):
                     )
                     return
 
+            # [MODIFIED] Removed the code that separately collects background marks
+            # and calls set_auto_labeling_marks again, as marks are already set
+            # in on_new_marks (combined marks including both prompts and backgrounds).
+            # This avoids overwriting the existing combined marks.
+
             self.model_manager.predict_shapes_threading(
                 self.parent.image, self.parent.filename
             )
@@ -753,7 +758,45 @@ class AutoLabelingWidget(QWidget):
 
     def on_new_marks(self, marks):
         """Handle new marks"""
-        self.model_manager.set_auto_labeling_marks(marks)
+        # 将画布上显式标注为 background/_background_ 的 shapes 也当作排除标记一并传入模型
+        extra_marks = []
+        try:
+            canvas = getattr(self.parent, 'canvas', None)
+            if canvas is not None:
+                for shape in getattr(canvas, 'shapes', []):
+                    try:
+                        lab = (shape.label or '').strip()
+                        if lab.lower() in ('_background_', 'background'):
+                            if getattr(shape, 'shape_type', '') == 'polygon':
+                                pts = [[int(p.x()), int(p.y())] for p in shape.points]
+                                if pts:
+                                    extra_marks.append({
+                                        'type': 'polygon',
+                                        'data': pts,
+                                        'label': lab,
+                                        'is_exclusion': True,
+                                    })
+                            elif getattr(shape, 'shape_type', '') == 'rectangle':
+                                if len(shape.points) >= 3:
+                                    x0, y0 = int(shape.points[0].x()), int(shape.points[0].y())
+                                    x1, y1 = int(shape.points[2].x()), int(shape.points[2].y())
+                                    extra_marks.append({
+                                        'type': 'rectangle',
+                                        'data': [x0, y0, x1, y1],
+                                        'label': lab,
+                                        'is_exclusion': True,
+                                    })
+                    except Exception:
+                        continue
+        except Exception:
+            extra_marks = []
+
+        combined_marks = list(marks or []) + extra_marks
+        try:
+            logger.info(f"[AutoLabeling] combined_marks count={len(combined_marks)}, details={[ (m.get('type'), m.get('label')) for m in combined_marks ]}")
+        except Exception:
+            pass
+        self.model_manager.set_auto_labeling_marks(combined_marks)
         current_model_name = self.model_manager.loaded_model_config["type"]
         if current_model_name not in _SKIP_PREDICTION_ON_NEW_MARKS_MODELS:
             self.run_prediction()

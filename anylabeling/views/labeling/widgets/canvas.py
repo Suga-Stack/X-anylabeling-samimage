@@ -8,6 +8,7 @@ from PyQt5.QtGui import QWheelEvent
 
 from anylabeling.services.auto_labeling.types import AutoLabelingMode
 from anylabeling.views.labeling.utils.colormap import label_colormap
+import logging
 
 from .. import utils
 from ..shape import Shape
@@ -208,6 +209,7 @@ class Canvas(
             "line",
             "point",
             "linestrip",
+            "scribble",
         ]:
             raise ValueError(f"Unsupported create_mode: {value}")
         self._create_mode = value
@@ -460,9 +462,18 @@ class Canvas(
                 self.current.highlight_vertex(0, Shape.NEAR_VERTEX)
             else:
                 self.override_cursor(CURSOR_DRAW)
-            if self.create_mode in ["polygon", "linestrip"]:
+            if self.create_mode in ["polygon", "linestrip", "scribble"]:
                 self.line[0] = self.current[-1]
                 self.line[1] = pos
+                # For scribble mode, append points continuously while moving
+                if self.create_mode == "scribble":
+                    try:
+                        last = self.current[-1]
+                        # Only append if movement is significant to reduce points
+                        if utils.distance(pos - last) >= 2.0:
+                            self.current.add_point(pos)
+                    except Exception:
+                        pass
             elif self.create_mode == "rectangle":
                 self.line.points = [self.current[0], pos]
                 self.line.close()
@@ -793,8 +804,12 @@ class Canvas(
                             self.on_auto_decode_timeout()
                             return
 
-                    # Create new shape.
-                    self.current = Shape(shape_type=self.create_mode)
+                    # Create new shape. For 'scribble' mode use a linestrip shape
+                    # (linestrip is supported and represents a freeform stroke).
+                    if self.create_mode == "scribble":
+                        self.current = Shape(shape_type="linestrip")
+                    else:
+                        self.current = Shape(shape_type=self.create_mode)
                     self.current.add_point(pos)
                     if self.create_mode == "point":
                         self.finalise()
@@ -810,7 +825,10 @@ class Canvas(
                     "rotation",
                 ]:
                     # Create new shape.
-                    self.current = Shape(shape_type=self.create_mode)
+                    if self.create_mode == "scribble":
+                        self.current = Shape(shape_type="linestrip")
+                    else:
+                        self.current = Shape(shape_type=self.create_mode)
                     self.current.add_point(pos)
                     self.line.points = [pos, pos]
                     self.set_hiding()
@@ -879,6 +897,36 @@ class Canvas(
                     self.selection_changed.emit(
                         [x for x in self.selected_shapes if x != self.h_hape]
                     )
+
+        # If we were drawing a scribble, finish and mark it as exclusion/background
+        if (
+            ev.button() == QtCore.Qt.LeftButton
+            and self.drawing()
+            and self.create_mode == "scribble"
+            and self.current
+        ):
+            try:
+                # Require at least two points/movement to consider this a scribble
+                if len(self.current.points) <= 1:
+                    # Discard trivial single-click scribble
+                    self.current = None
+                    self.set_hiding(False)
+                    self.drawing_polygon.emit(False)
+                    self.update()
+                else:
+                    if not hasattr(self.current, "other_data") or self.current.other_data is None:
+                        self.current.other_data = {}
+                    self.current.other_data["is_exclusion"] = True
+                    # Mark shape label as background for UI recognition
+                    try:
+                        self.current.label = "_background_"
+                    except Exception:
+                        pass
+                    # Optionally fill to visualize scribble area
+                    self.current.fill = True
+                    self.finalise()
+            except Exception:
+                pass
 
         self.store_moving_shape()
 
@@ -1866,6 +1914,13 @@ class Canvas(
     def finalise(self):
         """Finish drawing for a shape"""
         assert self.current
+        logger = logging.getLogger(__name__)
+        try:
+            logger.info(
+                f"[Canvas.finalise] is_auto_labeling={self.is_auto_labeling}, auto_labeling_mode={self.auto_labeling_mode}, shape_type={self.current.shape_type}, label={self.current.label}"
+            )
+        except Exception:
+            pass
         if (
             self.is_auto_labeling
             and self.auto_labeling_mode != AutoLabelingMode.NONE

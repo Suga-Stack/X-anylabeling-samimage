@@ -59,7 +59,7 @@ class SAMImage(Model):
             "rectangle": QCoreApplication.translate("Model", "矩形"),
             "mask": QCoreApplication.translate("Model", "掩码"),
         }
-        default_output_mode = "polygon"  # 默认输出多边形格式，符合labelme要求
+        default_output_mode = "polygon"
 
     def __init__(self, config_path, on_message) -> None:
         """Initialize the defect detection model with given configuration."""
@@ -98,7 +98,9 @@ class SAMImage(Model):
         self._initialize_model()
         
         # 标注相关配置
-        self.marks = []
+        self.marks = []               # 原始marks（用于调试）
+        self.prompt_marks = []        # 用于SAM提示的非背景标记
+        self.exclusion_marks = []      # 用于背景排除的标记
         self.replace = True
         self.epsilon = 0.001
         
@@ -110,6 +112,11 @@ class SAMImage(Model):
         self.original_size = None
         self.resized_size = None
         
+        # 调试图片保存路径
+        self.debug_dir = "sam_debug"
+        if not os.path.exists(self.debug_dir):
+            os.makedirs(self.debug_dir)
+            
         logger.info("清华聚好看-SAM缺陷检测模型初始化完成")
 
     def set_mask_fineness(self, epsilon: float):
@@ -162,15 +169,20 @@ class SAMImage(Model):
         
         return resized_image
 
-    def _scale_marks_to_resized(self) -> tuple:
-        """将原始尺寸的marks缩放到缩放后的尺寸
+    def _scale_marks_to_resized(self, marks_list) -> tuple:
+        """将原始尺寸的marks缩放到缩放后的尺寸，只考虑非背景标记
+        
+        Args:
+            marks_list: 要缩放的marks列表（通常为 self.prompt_marks）
         
         Returns:
             tuple: (point_coords, point_labels, box) - 缩放后的提示
         """
         point_coords, point_labels, box = None, None, None
         
-        for m in self.marks:
+        logger.debug(f"_scale_marks_to_resized: 处理 {len(marks_list)} 个marks")
+        for idx, m in enumerate(marks_list):
+            logger.debug(f"  检查mark {idx}: {m}")
             if not isinstance(m, dict) or 'type' not in m:
                 continue
                 
@@ -196,7 +208,7 @@ class SAMImage(Model):
                             float(x1 * self.scale_factor),
                             float(y1 * self.scale_factor)
                         ]
-                        logger.debug(f"矩形提示缩放: ({x0}, {y0}, {x1}, {y1}) -> ({box[0]:.1f}, {box[1]:.1f}, {box[2]:.1f}, {box[3]:.1f})")
+                        logger.info(f"  选中非背景矩形提示: ({x0}, {y0}, {x1}, {y1}) -> 缩放后 {box}")
                         break
                 except Exception as e:
                     logger.warning(f"矩形提示缩放失败: {e}")
@@ -243,26 +255,41 @@ class SAMImage(Model):
 
 
     def set_auto_labeling_marks(self, marks):
-        """由 UI 注入交互标记（点/框）"""
+        """由 UI 注入交互标记（点/框），分离背景标记和提示标记"""
         self.marks = marks or []
+        # 分类
+        self.prompt_marks = []
+        self.exclusion_marks = []
+        for m in self.marks:
+            if not isinstance(m, dict):
+                continue
+            label = m.get('label') or m.get('name') or ''
+            is_bg = str(label).lower() in ('_background_', 'background', 'bg')
+            if is_bg or m.get('is_exclusion') or m.get('exclude'):
+                self.exclusion_marks.append(m)
+            else:
+                self.prompt_marks.append(m)
+        logger.info(f"set_auto_labeling_marks: prompt={len(self.prompt_marks)}, exclusion={len(self.exclusion_marks)}")
 
     def set_auto_labeling_preserve_existing_annotations_state(self, state: bool):
         """与 UI 的"保留已有标注"开关联动"""
         self.replace = not bool(state)
 
     def marks_to_prompts(self):
-        """将 UI 的 marks 转换为 SAM 可用的提示（优先矩形框）
+        """将 self.prompt_marks 转换为 SAM 可用的提示（优先矩形框）
         
         返回:
-            tuple: (point_coords, point_labels, box)
+            tuple: (point_coords, point_labels, box) - 仅包含非背景的提示
         """
         # 对于已经初始化过的缩放，使用缩放后的marks
         if self.scale_factor != 1.0:
-            return self._scale_marks_to_resized()
+            return self._scale_marks_to_resized(self.prompt_marks)
         
         point_coords, point_labels, box = None, None, None
         
-        for m in self.marks:
+        logger.debug(f"marks_to_prompts: 共有 {len(self.prompt_marks)} 个提示标记")
+        for idx, m in enumerate(self.prompt_marks):
+            logger.debug(f"  检查提示标记 {idx}: {m}")
             if not isinstance(m, dict) or 'type' not in m:
                 continue
                 
@@ -289,7 +316,7 @@ class SAMImage(Model):
                             float(x1),
                             float(y1)
                         ]
-                        logger.debug(f"检测到矩形提示: {box}")
+                        logger.info(f"  选中非背景矩形提示: {box}")
                         break
                 except Exception as e:
                     logger.warning(f"矩形提示解析失败: {e}")
@@ -303,12 +330,7 @@ class SAMImage(Model):
         return point_coords, point_labels, box
 
     def _initialize_model(self):
-        """初始化SAM模型，支持先加载 base 权重（例如 vit_b.pth），再加载小的 adapter/LoRA 权重。
-
-        兼容以下情况：
-        - 单一 model_path（历史行为，加载一个完整权重或部分权重）
-        - 提供 base_model_path + model_path（推荐）：先加载 base，再加载 adapter（strict=False）
-        """
+        """初始化SAM模型，支持先加载 base 权重，再加载 adapter/LoRA 权重。"""
         try:
             # 创建基础模型（不传 checkpoint）
             net = sam_model_registry[self.model_cfg](checkpoint=None)
@@ -407,6 +429,137 @@ class SAMImage(Model):
 
         return [dict_input]
 
+    def _has_exclusion_marks(self):
+        """检查是否有真正的排除标记（严格判断）"""
+        return len(self.exclusion_marks) > 0
+
+    def _build_exclusion_mask(self, h: int, w: int, target_size: tuple = None):
+        """根据 self.exclusion_marks 构建一个布尔型的排除掩码。
+        
+        只处理明确标记为背景的形状。
+        
+        Args:
+            h: 原始高度（用于日志）
+            w: 原始宽度（用于日志）
+            target_size: 目标尺寸 (height, width)，如果提供，会将排除掩码缩放到此尺寸
+        
+        返回: np.ndarray(dtype=bool) 或 None
+        """
+        if not self.exclusion_marks:
+            logger.debug("exclusion_marks为空，跳过排除掩码构建")
+            return None
+
+        # 在原始图像尺寸上构建掩码
+        original_h, original_w = self.original_size if self.original_size else (h, w)
+        mask = np.zeros((original_h, original_w), dtype=bool)
+        bg_marks_count = 0
+        
+        for idx, m in enumerate(self.exclusion_marks):
+            try:
+                if not isinstance(m, dict) or 'type' not in m:
+                    continue
+
+                # 记录找到的背景标记
+                bg_marks_count += 1
+                logger.debug(f"处理背景标记 {idx}: type={m['type']}, label={m.get('label')}")
+                
+                # 处理多边形/涂鸦
+                if m['type'] in ['polygon', 'scribble', 'freeform']:
+                    data = m.get('data')
+                    if data is None or len(data) < 3:
+                        continue
+                        
+                    try:
+                        pts = np.array(data, dtype=np.int32)
+                        if pts.size >= 6:  # 至少3个点
+                            cv2.fillPoly(mask, [pts.reshape(-1, 2)], True)
+                            logger.debug(f"  填充多边形，点数: {len(pts)}")
+                    except Exception as e:
+                        logger.warning(f"多边形处理失败: {e}")
+                        continue
+                
+                # 处理矩形
+                elif m['type'] == 'rectangle':
+                    data = m.get('data')
+                    if data is None:
+                        continue
+                        
+                    try:
+                        # 解析矩形坐标
+                        if isinstance(data, (list, tuple, np.ndarray)):
+                            arr = np.array(data, dtype=np.float32).flatten()
+                            if len(arr) >= 4:
+                                x0, y0 = float(arr[0]), float(arr[1])
+                                x1, y1 = float(arr[2]), float(arr[3])
+                                
+                                logger.debug(f"  背景矩形原始坐标: ({x0:.1f}, {y0:.1f}) -> ({x1:.1f}, {y1:.1f})")
+                                
+                                # 确保坐标有序
+                                x0, x1 = min(x0, x1), max(x0, x1)
+                                y0, y1 = min(y0, y1), max(y0, y1)
+                                
+                                # 转换为整数并裁剪到图像范围内
+                                x0i = int(max(0, min(original_w-1, x0)))
+                                y0i = int(max(0, min(original_h-1, y0)))
+                                x1i = int(max(0, min(original_w, x1)))
+                                y1i = int(max(0, min(original_h, y1)))
+                                
+                                if x1i > x0i and y1i > y0i:
+                                    mask[y0i:y1i, x0i:x1i] = True
+                                    logger.debug(f"  填充原始矩形: [{x0i},{y0i},{x1i},{x1i-x0i} x {y1i-y0i}]")
+                                else:
+                                    logger.debug(f"  背景矩形无效: [{x0i},{y0i},{x1i},{y1i}]")
+                    except Exception as e:
+                        logger.warning(f"矩形处理失败: {e}")
+                        continue
+                
+                # 处理mask
+                elif m['type'] == 'mask':
+                    data = m.get('data')
+                    if data is None:
+                        continue
+                        
+                    try:
+                        arr = np.array(data)
+                        if arr.shape[:2] == (original_h, original_w):
+                            mask |= (arr.astype(bool))
+                            logger.debug(f"  直接使用mask，形状: {arr.shape}")
+                        else:
+                            # 缩放mask到原始尺寸
+                            arr_u8 = (arr.astype(np.uint8) * 255)
+                            arr_rs = cv2.resize(arr_u8, (original_w, original_h), interpolation=cv2.INTER_NEAREST)
+                            mask |= (arr_rs > 0)
+                            logger.debug(f"  缩放mask: {arr.shape} -> ({original_h},{original_w})")
+                    except Exception as e:
+                        logger.warning(f"mask处理失败: {e}")
+                        continue
+
+            except Exception as e:
+                logger.warning(f"处理背景标记时出错: {e}")
+                continue
+
+        # 如果需要缩放到目标尺寸
+        if target_size is not None and (target_size[0] != original_h or target_size[1] != original_w):
+            target_h, target_w = target_size
+            logger.debug(f"缩放排除掩码: {original_h}x{original_w} -> {target_h}x{target_w}")
+            
+            # 缩放掩码
+            mask_u8 = mask.astype(np.uint8) * 255
+            mask_resized = cv2.resize(mask_u8, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+            mask = mask_resized > 0
+            
+            # 打印缩放后的非零像素数
+            logger.debug(f"缩放后排除掩码非零像素: {np.count_nonzero(mask)}/{target_h*target_w}")
+
+        nnz = int(np.count_nonzero(mask))
+        logger.info(f"[SAMImage] 背景标记统计: 找到 {bg_marks_count} 个背景标记, 排除掩码非零像素: {nnz}/{mask.size} ({nnz/mask.size*100:.2f}%)")
+
+        if nnz == 0:
+            logger.debug("排除掩码为空，返回None")
+            return None
+
+        return mask
+
     def postprocess(self, image, outputs):
         """后处理模型输出，生成多边形轮廓"""
         if outputs is None or len(outputs) == 0:
@@ -416,24 +569,20 @@ class SAMImage(Model):
         masks = pred.get('masks', None)
         
         if masks is None:
-            # 回退到低分辨率logits
             low_res = pred.get('low_res_logits', None)
             if low_res is None:
                 return []
-                
-            # 阈值化并上采样
             thr = float(self.mask_threshold)
             masks = (low_res > thr).float()
             oh, ow = image.shape[:2]
             masks = F.interpolate(masks, size=(oh, ow), mode='bilinear', align_corners=False) > 0
 
-        # 处理mask形状
         if masks.dim() == 3:
             masks = masks.unsqueeze(0)
 
-        masks_np = masks[0].detach().to('cpu').numpy()  # C x H x W
+        masks_np = masks[0].detach().to('cpu').numpy()
 
-        # 如果存在矩形提示，裁剪mask到矩形区域内
+        # 应用矩形框裁剪（仅对非背景提示框）
         _, _, maybe_box = self.marks_to_prompts()
         if maybe_box is not None:
             x0, y0, x1, y1 = [int(v) for v in maybe_box]
@@ -445,49 +594,99 @@ class SAMImage(Model):
                 box_mask[y0:y1, x0:x1] = True
                 masks_np = masks_np & box_mask
 
-        image_height, image_width = image.shape[:2]
+        # 获取掩码的实际尺寸
+        mask_h, mask_w = masks_np.shape[-2:]
         results = []
         label_name = self.classes[0] if self.classes else "defect"
 
+        # 只有在有真正背景标记时才构建排除掩码
+        exclusion_mask = None
+        if self._has_exclusion_marks():
+            # 传入掩码尺寸作为目标尺寸
+            exclusion_mask = self._build_exclusion_mask(
+                mask_h, 
+                mask_w, 
+                target_size=(mask_h, mask_w)
+            )
+            if exclusion_mask is not None:
+                logger.info(f"应用排除掩码，非零像素: {np.count_nonzero(exclusion_mask)}/{mask_h*mask_w}")
+
+        # 保存调试图片的计数器
+        debug_saved = False
+
         for ci in range(masks_np.shape[0]):
-            mask_bool = masks_np[ci]  # H x W
+            mask_bool = masks_np[ci].copy()  # 使用copy避免修改原数组
             
-            # 跳过空mask
+            # 记录原始面积
+            original_area = np.count_nonzero(mask_bool)
+            logger.debug(f"mask {ci}: 原始面积 = {original_area}")
+            
+            # 应用排除掩码（如果有）
+            if exclusion_mask is not None:
+                try:
+                    # 计算重叠区域
+                    overlap = np.count_nonzero(mask_bool & exclusion_mask)
+                    logger.debug(f"mask {ci}: 与排除掩码重叠 = {overlap}")
+                    
+                    # 确保尺寸匹配
+                    if mask_bool.shape == exclusion_mask.shape:
+                        # 保存调试图片（仅保存第一次）
+                        if not debug_saved:
+                            cv2.imwrite(os.path.join(self.debug_dir, 'original_mask.png'), (mask_bool.astype(np.uint8)*255))
+                            cv2.imwrite(os.path.join(self.debug_dir, 'exclusion_mask.png'), (exclusion_mask.astype(np.uint8)*255))
+                            
+                        # 使用逻辑与操作排除背景区域
+                        mask_bool = mask_bool & (~exclusion_mask)
+                        
+                        if not debug_saved:
+                            cv2.imwrite(os.path.join(self.debug_dir, 'result_mask.png'), (mask_bool.astype(np.uint8)*255))
+                            debug_saved = True
+                            logger.info(f"调试图片已保存到 {self.debug_dir} 目录")
+                        
+                        after_nz = np.count_nonzero(mask_bool)
+                        removed = original_area - after_nz
+                        logger.debug(f"mask {ci}: 排除后面积 = {after_nz}, 排除像素 = {removed}")
+                        
+                        if removed > 0 and after_nz == 0:
+                            logger.debug(f"  mask {ci} 被完全排除")
+                    else:
+                        logger.warning(f"尺寸不匹配: mask {mask_bool.shape}, exclusion {exclusion_mask.shape}")
+                        
+                except Exception as e:
+                    logger.error(f"应用排除掩码时出错: {e}")
+                    continue
+            
             if not np.any(mask_bool):
+                logger.debug(f"mask {ci}: 排除后为空，跳过")
                 continue
                 
-            # 转换为uint8用于轮廓检测
             mask_u8 = (mask_bool.astype(np.uint8)) * 255
-
-            # 形态学操作，去除小噪声
             kernel = np.ones((3, 3), np.uint8)
             mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
             mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
 
-            # 提取轮廓
             contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
             contour_points = []
             for cnt in contours:
                 if cnt is None or len(cnt) < 3:
                     continue
-                    
-                # 多边形简化
                 eps = self.epsilon * cv2.arcLength(cnt, True)
                 approx = cv2.approxPolyDP(cnt, eps, True)
                 pts = approx.reshape(-1, 2).tolist()
-                
-                # 过滤太小的多边形
                 if len(pts) >= 3 and cv2.contourArea(approx) > 10:
                     contour_points.append(pts)
 
             if contour_points:
                 results.append((label_name, contour_points))
-                logger.debug(f"检测到 {len(contour_points)} 个缺陷区域")
+                logger.debug(f"mask {ci}: 生成 {len(contour_points)} 个轮廓")
+            else:
+                logger.debug(f"mask {ci}: 没有有效轮廓")
 
         # 将坐标映射回原始图像尺寸
         results = self._scale_results_back_to_original(results)
         
+        logger.info(f"后处理完成，找到 {len(results)} 个缺陷区域")
         return results
 
     def predict_shapes(self, image, image_path=None):
@@ -495,15 +694,25 @@ class SAMImage(Model):
         if image is None:
             return AutoLabelingResult([], replace=False)
 
+        # 调试：打印所有marks
+        logger.info("="*50)
+        logger.info(f"开始预测，marks总数: {len(self.marks)}")
+        for i, m in enumerate(self.marks or []):
+            logger.info(f"  mark {i}: type={m.get('type')}, label={m.get('label')}, is_exclusion={m.get('is_exclusion')}, data={m.get('data')}")
+        logger.info(f"提示标记数: {len(self.prompt_marks)}, 背景标记数: {len(self.exclusion_marks)}")
+        logger.info("="*50)
+
         try:
             image = qt_img_to_rgb_cv_img(image, image_path)
         except Exception as e:
             logger.warning(f"图像转换失败: {e}")
             return AutoLabelingResult([], replace=False)
 
+        # 记录原始尺寸
+        self.original_size = (image.shape[0], image.shape[1])
+        
         # 重置缩放因子（为下一次预测准备）
         self.scale_factor = 1.0
-        self.original_size = None
         self.resized_size = None
 
         # 先计算会使用的缩放因子（不实际缩放图像）
@@ -512,11 +721,13 @@ class SAMImage(Model):
         if max_side > self.max_input_size:
             self.scale_factor = self.max_input_size / max_side
         
-        # 检查是否有交互提示（此时scale_factor已正确设置）
+        # 检查是否有非背景矩形提示
         _, _, maybe_box = self.marks_to_prompts()
         if maybe_box is None:
-            logger.debug("未检测到矩形提示，跳过预测")
+            logger.warning("未检测到非背景矩形提示，跳过预测")
             return AutoLabelingResult([], replace=False)
+        else:
+            logger.info(f"检测到非背景矩形提示框: {maybe_box}")
 
         try:
             # 预处理 -> 推理 -> 后处理
