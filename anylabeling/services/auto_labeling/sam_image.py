@@ -451,7 +451,8 @@ class SAMImage(Model):
 
         # 在原始图像尺寸上构建掩码
         original_h, original_w = self.original_size if self.original_size else (h, w)
-        mask = np.zeros((original_h, original_w), dtype=bool)
+        # 使用 uint8 类型构建掩码，因为 OpenCV 函数需要这个类型
+        mask_uint8 = np.zeros((original_h, original_w), dtype=np.uint8)
         bg_marks_count = 0
         
         for idx, m in enumerate(self.exclusion_marks):
@@ -472,10 +473,13 @@ class SAMImage(Model):
                     try:
                         pts = np.array(data, dtype=np.int32)
                         if pts.size >= 6:  # 至少3个点
-                            cv2.fillPoly(mask, [pts.reshape(-1, 2)], True)
+                            # 确保掩码是 uint8 类型
+                            cv2.fillPoly(mask_uint8, [pts.reshape(-1, 2)], 255)
                             logger.debug(f"  填充多边形，点数: {len(pts)}")
                     except Exception as e:
                         logger.warning(f"多边形处理失败: {e}")
+                        # 打印更多调试信息
+                        logger.warning(f"  数据类型: mask_uint8.dtype={mask_uint8.dtype}, pts.shape={pts.shape}")
                         continue
                 
                 # 处理矩形
@@ -505,7 +509,7 @@ class SAMImage(Model):
                                 y1i = int(max(0, min(original_h, y1)))
                                 
                                 if x1i > x0i and y1i > y0i:
-                                    mask[y0i:y1i, x0i:x1i] = True
+                                    mask_uint8[y0i:y1i, x0i:x1i] = 255
                                     logger.debug(f"  填充原始矩形: [{x0i},{y0i},{x1i},{x1i-x0i} x {y1i-y0i}]")
                                 else:
                                     logger.debug(f"  背景矩形无效: [{x0i},{y0i},{x1i},{y1i}]")
@@ -522,13 +526,13 @@ class SAMImage(Model):
                     try:
                         arr = np.array(data)
                         if arr.shape[:2] == (original_h, original_w):
-                            mask |= (arr.astype(bool))
+                            mask_uint8[arr > 0] = 255
                             logger.debug(f"  直接使用mask，形状: {arr.shape}")
                         else:
                             # 缩放mask到原始尺寸
                             arr_u8 = (arr.astype(np.uint8) * 255)
                             arr_rs = cv2.resize(arr_u8, (original_w, original_h), interpolation=cv2.INTER_NEAREST)
-                            mask |= (arr_rs > 0)
+                            mask_uint8[arr_rs > 0] = 255
                             logger.debug(f"  缩放mask: {arr.shape} -> ({original_h},{original_w})")
                     except Exception as e:
                         logger.warning(f"mask处理失败: {e}")
@@ -538,14 +542,16 @@ class SAMImage(Model):
                 logger.warning(f"处理背景标记时出错: {e}")
                 continue
 
+        # 转换为布尔掩码
+        mask = mask_uint8 > 0
+
         # 如果需要缩放到目标尺寸
         if target_size is not None and (target_size[0] != original_h or target_size[1] != original_w):
             target_h, target_w = target_size
             logger.debug(f"缩放排除掩码: {original_h}x{original_w} -> {target_h}x{target_w}")
             
-            # 缩放掩码
-            mask_u8 = mask.astype(np.uint8) * 255
-            mask_resized = cv2.resize(mask_u8, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+            # 缩放掩码（使用 uint8 版本进行缩放，避免类型问题）
+            mask_resized = cv2.resize(mask_uint8, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
             mask = mask_resized > 0
             
             # 打印缩放后的非零像素数
